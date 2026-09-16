@@ -212,4 +212,4 @@ www.linkedin.com/in/pakala-ajaybabu
 
 # App Link
 
-https://insightgpt-ajaypakala.streamlit.app/
+https://northstar-ajaypakala.streamlit.app/
