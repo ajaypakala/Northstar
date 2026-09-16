@@ -742,10 +742,10 @@ st.divider()
 # APPLICATION INFORMATION
 # ==========================================================
 
-with st.expander("ℹ About InsightGPT"):
+with st.expander("ℹ About Northstar"):
 
     st.markdown("""
-### InsightGPT – Enterprise AI Data Analyst
+### Northstar – Enterprise AI Data Analyst
 
 Features
 
@@ -779,7 +779,7 @@ st.markdown(
 ---
 <div style="text-align:center">
 
-### 🚀 InsightGPT - Enterprise AI Data Analyst
+### 🚀 Northstar - Enterprise AI Data Analyst
 
 Built with ❤️ using
 

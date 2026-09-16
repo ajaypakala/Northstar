@@ -12,7 +12,7 @@ load_dotenv()
 # APP
 # =====================================================
 
-APP_NAME = "InsightGPT - Enterprise AI Data Analyst"
+APP_NAME = "Northstar"
 
 APP_ICON = "📊"
 
