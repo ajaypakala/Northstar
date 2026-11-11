@@ -1,444 +1,284 @@
 
-"""
-Northstar
-Universal AI Data Cleaning Engine
-
-Designed to work with different CSV datasets:
-Sales, HR, Finance, Healthcare, Education,
-Marketing, Inventory and more.
-
-No dataset-specific business rules are applied automatically.
-"""
+# analysis/cleaner.py
 
 import re
+import json
 import pandas as pd
+import numpy as np
 
 
-# ==========================================================
-# CONFIGURATION
-# ==========================================================
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
 
-DATE_KEYWORDS = (
-    "date", "time", "timestamp", "datetime",
-    "created_at", "updated_at", "dob",
-    "birth_date", "joining_date"
-)
-
-IDENTIFIER_KEYWORDS = (
-    "id", "code", "zip", "postal",
-    "phone", "mobile", "account_number",
-    "employee_number", "roll_number"
-)
-
-MISSING_TEXT_VALUES = {
-    "", "null", "none", "nan", "n/a", "na",
-    "not available", "not applicable", "-"
+MISSING_VALUES = {
+    "", "na", "n/a", "nan", "none", "null",
+    "nil", "missing", "not available"
 }
 
+DATE_NAME_HINTS = {
+    "date", "datetime", "timestamp", "time",
+    "created_at", "updated_at", "birth_date",
+    "joining_date"
+}
 
-# ==========================================================
-# 1. CLEAN COLUMN NAMES
-# ==========================================================
+ID_NAME_HINTS = {
+    "id", "code", "zip", "postal", "phone",
+    "mobile", "account_number", "employee_number",
+    "roll_number", "registration_number"
+}
+
+# These symbols are removed when parsing numeric strings.
+# Percent signs are removed without changing the numeric scale.
+NUMERIC_CLEAN_PATTERN = re.compile(r"[₹$€£,\s%]")
+
+
+# --------------------------------------------------
+# Column names
+# --------------------------------------------------
 
 def clean_column_names(df):
-    """
-    Standardize column names and handle duplicate names.
-    """
-
+    """Standardize column names and make duplicate names unique."""
     df = df.copy()
-
-    columns = []
+    new_columns = []
+    seen = {}
 
     for column in df.columns:
-
         name = str(column).strip().lower()
-
         name = re.sub(r"[^\w]+", "_", name)
-
-        name = name.strip("_")
+        name = re.sub(r"_+", "_", name).strip("_")
 
         if not name:
             name = "unnamed_column"
 
-        columns.append(name)
+        count = seen.get(name, 0)
+        seen[name] = count + 1
 
-    counts = {}
-    unique_columns = []
+        if count:
+            name = f"{name}_{count + 1}"
 
-    for column in columns:
+        new_columns.append(name)
 
-        counts[column] = counts.get(column, 0) + 1
-
-        if counts[column] == 1:
-            unique_columns.append(column)
-        else:
-            unique_columns.append(
-                f"{column}_{counts[column]}"
-            )
-
-    df.columns = unique_columns
-
+    df.columns = new_columns
     return df
 
 
-# ==========================================================
-# 2. STANDARDIZE TEXT VALUES
-# ==========================================================
+def is_identifier_column(column_name):
+    """Identify likely identifier columns using complete name tokens."""
+    tokens = set(re.split(r"[_\W]+", str(column_name).lower()))
+    return bool(tokens.intersection(ID_NAME_HINTS))
+
+
+def is_date_named_column(column_name):
+    """Check date hints using complete name tokens."""
+    tokens = set(re.split(r"[_\W]+", str(column_name).lower()))
+    return bool(tokens.intersection(DATE_NAME_HINTS))
+
+
+# --------------------------------------------------
+# Text cleaning
+# --------------------------------------------------
 
 def standardize_text(df):
-    """
-    Remove extra whitespace and normalize common
-    representations of missing text values.
-    """
-
+    """Trim whitespace and standardize common missing markers."""
     df = df.copy()
 
-    for column in df.columns:
+    for column in df.select_dtypes(include=["object", "string"]).columns:
+        values = df[column].astype("string").str.strip()
+        values = values.str.replace(r"\s+", " ", regex=True)
 
-        if (
-            pd.api.types.is_object_dtype(df[column])
-            or pd.api.types.is_string_dtype(df[column])
-        ):
+        lower_values = values.str.lower()
+        values = values.mask(lower_values.isin(MISSING_VALUES), pd.NA)
 
-            values = df[column].astype("string")
-
-            values = (
-                values
-                .str.strip()
-                .str.replace(r"\s+", " ", regex=True)
-            )
-
-            # Normalize common missing-value indicators
-            missing_mask = (
-                values.str.lower()
-                .isin(MISSING_TEXT_VALUES)
-            )
-
-            values = values.mask(missing_mask, pd.NA)
-
-            df[column] = values
+        df[column] = values
 
     return df
 
 
-# ==========================================================
-# 3. REMOVE EMPTY ROWS
-# ==========================================================
+# --------------------------------------------------
+# Numeric detection
+# --------------------------------------------------
 
-def remove_empty_rows(df):
-    """
-    Remove rows where all values are missing.
-    """
+def parse_numeric_series(series):
+    """Convert common formatted numeric strings into numbers."""
+    text = series.astype("string").str.strip()
 
-    return df.dropna(
-        how="all"
-    ).reset_index(drop=True)
+    # Support values such as (120.50) to represent -120.50.
+    is_parenthesized = text.str.match(r"^\(.*\)$", na=False)
+    text = text.str.replace(r"^\((.*)\)$", r"\1", regex=True)
 
+    text = text.str.replace(NUMERIC_CLEAN_PATTERN, "", regex=True)
+    numeric = pd.to_numeric(text, errors="coerce")
 
-# ==========================================================
-# 4. REMOVE EMPTY COLUMNS
-# ==========================================================
+    numeric.loc[is_parenthesized & numeric.notna()] *= -1
+    return numeric
 
-def remove_empty_columns(df):
-    """
-    Remove columns where all values are missing.
-    """
-
-    return df.dropna(
-        axis=1,
-        how="all"
-    )
-
-
-# ==========================================================
-# 5. REMOVE DUPLICATES
-# ==========================================================
-
-def remove_duplicates(df, subset=None):
-    """
-    Remove duplicate records.
-
-    Default:
-        Removes only completely identical rows.
-
-    Optional:
-        subset can contain selected business key columns.
-    """
-
-    df = df.copy()
-
-    if subset is not None:
-
-        if isinstance(subset, str):
-            subset = [subset]
-
-        missing = [
-            col for col in subset
-            if col not in df.columns
-        ]
-
-        if missing:
-            raise ValueError(
-                f"Columns not found: {missing}"
-            )
-
-    return df.drop_duplicates(
-        subset=subset,
-        keep="first"
-    ).reset_index(drop=True)
-
-
-# ==========================================================
-# 6. DETECT DATETIME COLUMNS
-# ==========================================================
-
-def detect_datetime_columns(df, threshold=0.95):
-    """
-    Detect date columns using column names and values.
-
-    Named date columns:
-        Require at least 50% valid date values.
-
-    Other columns:
-        Require at least 95% valid date values.
-
-    Invalid values become NaT.
-    """
-
-    df = df.copy()
-
-    for column in df.columns:
-
-        if pd.api.types.is_datetime64_any_dtype(df[column]):
-            continue
-
-        if not (
-            pd.api.types.is_object_dtype(df[column])
-            or pd.api.types.is_string_dtype(df[column])
-        ):
-            continue
-
-        original = df[column]
-
-        non_null_count = original.notna().sum()
-
-        if non_null_count == 0:
-            continue
-
-        name = column.lower()
-
-        is_date_column = any(
-            keyword in name
-            for keyword in DATE_KEYWORDS
-        )
-
-        try:
-
-            converted = pd.to_datetime(
-                original,
-                errors="coerce",
-                format="mixed"
-            )
-
-            valid_count = converted.notna().sum()
-
-            valid_percentage = (
-                valid_count / non_null_count
-            )
-
-            required_threshold = (
-                0.50 if is_date_column else threshold
-            )
-
-            if valid_percentage >= required_threshold:
-
-                df[column] = converted
-
-        except (ValueError, TypeError, OverflowError):
-            continue
-
-    return df
-
-
-# ==========================================================
-# 7. DETECT NUMERIC COLUMNS
-# ==========================================================
 
 def detect_numeric_columns(df, threshold=0.95):
-    """
-    Convert numeric-looking text columns into numeric types.
-
-    Avoids automatically converting identifiers.
-    """
-
-    df = df.copy()
+    """Detect numeric-looking text columns without converting likely IDs."""
+    detected = []
 
     for column in df.columns:
+        if is_identifier_column(column):
+            continue
+
+        if is_date_named_column(column):
+            continue
+
+        if pd.api.types.is_numeric_dtype(df[column]):
+            detected.append(column)
+            continue
 
         if not (
             pd.api.types.is_object_dtype(df[column])
-            or pd.api.types.is_string_dtype(df[column])
+            or isinstance(df[column].dtype, pd.StringDtype)
         ):
             continue
 
-        name = column.lower()
+        non_missing = df[column].dropna()
 
-        # Do not convert likely identifiers
-        if any(
-            keyword in name
-            for keyword in IDENTIFIER_KEYWORDS
+        if len(non_missing) == 0:
+            continue
+
+        converted = parse_numeric_series(non_missing)
+        valid_ratio = converted.notna().mean()
+
+        if valid_ratio >= threshold:
+            detected.append(column)
+
+    return detected
+
+
+# --------------------------------------------------
+# Date detection
+# --------------------------------------------------
+
+def parse_dates(series):
+    """Parse mixed date formats where supported by the installed pandas."""
+    try:
+        return pd.to_datetime(series, format="mixed", errors="coerce")
+    except (TypeError, ValueError):
+        return pd.to_datetime(series, errors="coerce")
+
+
+def looks_like_date_values(series):
+    """Require date-like characters to reduce accidental number conversion."""
+    sample = series.dropna().astype("string").head(100)
+
+    if sample.empty:
+        return False
+
+    date_pattern = sample.str.contains(
+        r"[-/:]|[A-Za-z]{3,}",
+        regex=True,
+        na=False
+    )
+
+    return date_pattern.mean() >= 0.5
+
+
+def detect_datetime_columns(df, threshold=0.80):
+    """Detect date columns using column names and actual values."""
+    detected = []
+
+    for column in df.columns:
+        series = df[column]
+
+        if pd.api.types.is_datetime64_any_dtype(series):
+            detected.append(column)
+            continue
+
+        if not (
+            pd.api.types.is_object_dtype(series)
+            or isinstance(series.dtype, pd.StringDtype)
         ):
             continue
 
-        # Do not convert date columns here
-        if any(
-            keyword in name
-            for keyword in DATE_KEYWORDS
-        ):
+        non_missing = series.dropna()
+
+        if len(non_missing) == 0:
             continue
 
-        original = df[column]
-
-        non_null_count = original.notna().sum()
-
-        if non_null_count == 0:
+        # Do not interpret ID-like values as dates.
+        if is_identifier_column(column):
             continue
 
-        cleaned = (
-            original.astype("string")
-            .str.strip()
-            .str.replace(",", "", regex=False)
-            .str.replace(r"^[₹$€£]\s*", "", regex=True)
-            .str.replace("%", "", regex=False)
-        )
+        # For columns without a date-like name, require date-like values.
+        if not is_date_named_column(column):
+            if not looks_like_date_values(non_missing):
+                continue
 
-        converted = pd.to_numeric(
-            cleaned,
-            errors="coerce"
-        )
+        parsed = parse_dates(non_missing)
+        valid_ratio = parsed.notna().mean()
 
-        valid_percentage = (
-            converted.notna().sum() / non_null_count
-        )
+        if valid_ratio >= threshold:
+            detected.append(column)
 
-        if valid_percentage >= threshold:
-
-            df[column] = converted
-
-    return df
+    return detected
 
 
-# ==========================================================
-# 8. HANDLE MISSING VALUES
-# ==========================================================
+# --------------------------------------------------
+# Missing values
+# --------------------------------------------------
 
 def fill_missing_values(
     df,
-    numeric_strategy="median",
-    categorical_strategy="mode",
-    fill_datetime=False
+    numeric_strategy="preserve",
+    categorical_strategy="preserve"
 ):
     """
-    Handle missing values according to column type.
+    Fill missing values only when explicitly requested.
 
-    Numeric:
-        median, mean or preserve.
+    numeric_strategy:
+        preserve, median, mean
 
-    Categorical:
-        mode, Unknown or preserve.
-
-    Datetime:
-        preserve by default.
+    categorical_strategy:
+        preserve, mode, unknown
     """
-
     df = df.copy()
 
     for column in df.columns:
+        if is_identifier_column(column):
+            continue
 
-        # Numeric columns
         if pd.api.types.is_numeric_dtype(df[column]):
-
             if numeric_strategy == "median":
-
                 value = df[column].median()
+                if pd.notna(value):
+                    df[column] = df[column].fillna(value)
 
             elif numeric_strategy == "mean":
-
                 value = df[column].mean()
+                if pd.notna(value):
+                    df[column] = df[column].fillna(value)
 
-            elif numeric_strategy == "preserve":
-
-                continue
-
-            else:
-
-                raise ValueError(
-                    "Invalid numeric strategy."
-                )
-
-            if pd.notna(value):
-
-                df[column] = df[column].fillna(value)
-
-        # Datetime columns
         elif pd.api.types.is_datetime64_any_dtype(df[column]):
+            # Dates are preserved unless a separate date policy is defined.
+            continue
 
-            if fill_datetime:
-
-                df[column] = (
-                    df[column]
-                    .ffill()
-                    .bfill()
-                )
-
-        # Categorical columns
-        else:
-
-            if categorical_strategy == "mode":
-
-                modes = df[column].mode(dropna=True)
-
-                if not modes.empty:
-
-                    df[column] = df[column].fillna(
-                        modes.iloc[0]
-                    )
-
-            elif categorical_strategy == "unknown":
-
+        elif numeric_strategy or categorical_strategy:
+            if categorical_strategy == "unknown":
                 df[column] = df[column].fillna("Unknown")
 
-            elif categorical_strategy == "preserve":
-
-                continue
-
-            else:
-
-                raise ValueError(
-                    "Invalid categorical strategy."
-                )
+            elif categorical_strategy == "mode":
+                modes = df[column].mode(dropna=True)
+                if not modes.empty:
+                    df[column] = df[column].fillna(modes.iloc[0])
 
     return df
 
 
-# ==========================================================
-# 9. DETECT OUTLIERS
-# ==========================================================
+# --------------------------------------------------
+# Outlier and quality checks
+# --------------------------------------------------
 
 def detect_outliers(df):
-    """
-    Identify numerical outliers using IQR.
+    """Flag IQR outliers; do not remove or modify them."""
+    results = {}
 
-    Does not remove outliers automatically.
-    """
-
-    results = []
-
-    numeric_columns = df.select_dtypes(
-        include="number"
-    ).columns
-
-    for column in numeric_columns:
+    for column in df.select_dtypes(include="number").columns:
+        if is_identifier_column(column):
+            continue
 
         values = df[column].dropna()
 
@@ -447,251 +287,185 @@ def detect_outliers(df):
 
         q1 = values.quantile(0.25)
         q3 = values.quantile(0.75)
-
         iqr = q3 - q1
 
-        if iqr == 0:
+        if pd.isna(iqr) or iqr == 0:
+            results[column] = 0
             continue
 
         lower = q1 - 1.5 * iqr
         upper = q3 + 1.5 * iqr
 
-        count = int(
+        results[column] = int(
             ((values < lower) | (values > upper)).sum()
         )
 
-        results.append({
-            "Column": column,
-            "Lower Bound": lower,
-            "Upper Bound": upper,
-            "Outlier Count": count
-        })
-
-    return pd.DataFrame(
-        results,
-        columns=[
-            "Column",
-            "Lower Bound",
-            "Upper Bound",
-            "Outlier Count"
-        ]
-    )
+    return results
 
 
-# ==========================================================
-# 10. VALIDATE DATA TYPES
-# ==========================================================
+def detect_negative_values(df):
+    """Report negative values in numeric columns without assuming they are invalid."""
+    results = {}
 
-def validate_data_types(df):
+    for column in df.select_dtypes(include="number").columns:
+        count = int((df[column] < 0).sum())
+
+        if count:
+            results[column] = count
+
+    return results
+
+
+def detect_repeated_identifier_values(df):
     """
-    Classify every column.
+    Report repeated values in likely ID columns.
+    Repeated IDs are not automatically deleted because they may be valid.
     """
-
-    results = []
+    results = {}
 
     for column in df.columns:
+        if not is_identifier_column(column):
+            continue
 
-        if pd.api.types.is_datetime64_any_dtype(df[column]):
-            dtype = "Datetime"
+        values = df[column].dropna()
+        duplicate_count = int(values.duplicated().sum())
 
-        elif pd.api.types.is_numeric_dtype(df[column]):
-            dtype = "Numeric"
+        if duplicate_count:
+            results[column] = duplicate_count
 
-        else:
-            dtype = "Categorical"
-
-        results.append({
-            "Column": column,
-            "Data Type": dtype,
-            "Pandas Type": str(df[column].dtype)
-        })
-
-    return pd.DataFrame(results)
+    return results
 
 
-# ==========================================================
-# 11. COMPLETE CLEANING PIPELINE
-# ==========================================================
+# --------------------------------------------------
+# Main cleaning pipeline
+# --------------------------------------------------
 
 def clean_dataset(
     df,
-    duplicate_subset=None,
-    numeric_strategy="median",
-    categorical_strategy="mode",
-    fill_datetime=False
+    numeric_strategy="preserve",
+    categorical_strategy="preserve",
+    remove_exact_duplicates=True
 ):
     """
-    Universal CSV cleaning pipeline.
+    General-purpose CSV cleaning pipeline.
 
-    No industry-specific assumptions are applied.
-
-    Parameters:
-        df: Input DataFrame.
-        duplicate_subset: Optional duplicate key columns.
-        numeric_strategy: median, mean or preserve.
-        categorical_strategy: mode, unknown or preserve.
-        fill_datetime: False by default.
-
-    Returns:
-        Cleaned DataFrame.
+    Safe defaults:
+    - No dataset-specific assumptions.
+    - No automatic deletion of repeated IDs.
+    - No automatic removal of negative values or outliers.
+    - No automatic filling of missing values.
     """
-
     if not isinstance(df, pd.DataFrame):
-
-        raise TypeError(
-            "Input must be a Pandas DataFrame."
-        )
-
-    if df.empty:
-
-        raise ValueError(
-            "Uploaded dataset is empty."
-        )
+        raise TypeError("Input must be a pandas DataFrame.")
 
     cleaned = df.copy()
 
-    # Step 1: Standardize column names
+    # 1. Standardize column names.
     cleaned = clean_column_names(cleaned)
 
-    # Step 2: Standardize text values
+    # 2. Standardize text and missing markers.
     cleaned = standardize_text(cleaned)
 
-    # Step 3: Remove completely empty rows
-    cleaned = remove_empty_rows(cleaned)
+    # 3. Remove completely empty rows and columns.
+    cleaned = cleaned.dropna(axis=0, how="all")
+    cleaned = cleaned.dropna(axis=1, how="all")
 
-    # Step 4: Remove completely empty columns
-    cleaned = remove_empty_columns(cleaned)
+    # 4. Remove exact duplicate rows only.
+    if remove_exact_duplicates:
+        cleaned = cleaned.drop_duplicates()
 
-    # Step 5: Remove exact duplicate rows
-    cleaned = remove_duplicates(
-        cleaned
-    )
+    # 5. Detect and convert date columns.
+    date_columns = detect_datetime_columns(cleaned)
 
-    # Step 6: Optional business-key duplicates
-    if duplicate_subset is not None:
+    for column in date_columns:
+        cleaned[column] = parse_dates(cleaned[column])
 
-        cleaned = remove_duplicates(
-            cleaned,
-            subset=duplicate_subset
-        )
+    # 6. Detect and convert numeric-looking text columns.
+    numeric_text_columns = detect_numeric_columns(cleaned)
 
-    # Step 7: Detect datetime columns
-    cleaned = detect_datetime_columns(cleaned)
+    for column in numeric_text_columns:
+        if not pd.api.types.is_numeric_dtype(cleaned[column]):
+            cleaned[column] = parse_numeric_series(cleaned[column])
 
-    # Step 8: Detect numeric columns
-    cleaned = detect_numeric_columns(cleaned)
-
-    # Step 9: Handle missing values
+    # 7. Apply optional missing-value strategies.
     cleaned = fill_missing_values(
         cleaned,
         numeric_strategy=numeric_strategy,
-        categorical_strategy=categorical_strategy,
-        fill_datetime=fill_datetime
+        categorical_strategy=categorical_strategy
     )
-
-    # Step 10: Reset index
-    cleaned = cleaned.reset_index(drop=True)
 
     return cleaned
 
 
-# ==========================================================
-# 12. CLEANING REPORT
-# ==========================================================
+# --------------------------------------------------
+# Cleaning report
+# --------------------------------------------------
 
 def cleaning_report(original_df, cleaned_df):
-    """
-    Generate detailed before-and-after statistics.
-    """
+    """Create a report that compares the input and cleaned datasets."""
+    original = original_df.copy()
+    cleaned = cleaned_df.copy()
 
-    original_missing = int(
-        original_df.isnull().sum().sum()
-    )
-
-    cleaned_missing = int(
-        cleaned_df.isnull().sum().sum()
-    )
-
-    type_summary = validate_data_types(cleaned_df)
-
-    outlier_summary = detect_outliers(cleaned_df)
+    original_missing = int(original.isna().sum().sum())
+    cleaned_missing = int(cleaned.isna().sum().sum())
 
     report = {
+        "original_rows": int(len(original)),
+        "cleaned_rows": int(len(cleaned)),
+        "rows_removed": int(len(original) - len(cleaned)),
 
-        "Original Rows": int(len(original_df)),
-
-        "Cleaned Rows": int(len(cleaned_df)),
-
-        "Rows Removed": int(
-            len(original_df) - len(cleaned_df)
+        "original_columns": int(len(original.columns)),
+        "cleaned_columns": int(len(cleaned.columns)),
+        "columns_removed": int(
+            len(original.columns) - len(cleaned.columns)
         ),
 
-        "Original Columns": int(
-            original_df.shape[1]
-        ),
+        "exact_duplicates_before": int(original.duplicated().sum()),
+        "exact_duplicates_after": int(cleaned.duplicated().sum()),
 
-        "Cleaned Columns": int(
-            cleaned_df.shape[1]
-        ),
+        "missing_values_before": original_missing,
+        "missing_values_after": cleaned_missing,
 
-        "Columns Removed": int(
-            original_df.shape[1] - cleaned_df.shape[1]
-        ),
+        "missing_values_by_column": {
+            str(column): int(count)
+            for column, count in cleaned.isna().sum().items()
+            if count > 0
+        },
 
-        "Original Missing Values": original_missing,
+        "detected_numeric_columns": [
+            str(column)
+            for column in cleaned.select_dtypes(include="number").columns
+        ],
 
-        "Missing Values Remaining": cleaned_missing,
+        "detected_datetime_columns": [
+            str(column)
+            for column in cleaned.columns
+            if pd.api.types.is_datetime64_any_dtype(cleaned[column])
+        ],
 
-        "Missing Values Handled": max(
-            0,
-            original_missing - cleaned_missing
-        ),
+        "detected_categorical_columns": [
+            str(column)
+            for column in cleaned.select_dtypes(
+                include=["object", "string", "category"]
+            ).columns
+        ],
 
-        "Original Exact Duplicates": int(
-            original_df.duplicated().sum()
-        ),
-
-        "Duplicate Rows Remaining": int(
-            cleaned_df.duplicated().sum()
-        ),
-
-        "Numeric Columns": int(
-            (type_summary["Data Type"] == "Numeric").sum()
-        ),
-
-        "Categorical Columns": int(
-            (type_summary["Data Type"] == "Categorical").sum()
-        ),
-
-        "Datetime Columns": int(
-            (type_summary["Data Type"] == "Datetime").sum()
-        ),
-
-        "Detected Date Columns": type_summary.loc[
-            type_summary["Data Type"] == "Datetime",
-            "Column"
-        ].tolist(),
-
-        "Detected Numeric Columns": type_summary.loc[
-            type_summary["Data Type"] == "Numeric",
-            "Column"
-        ].tolist(),
-
-        "Detected Categorical Columns": type_summary.loc[
-            type_summary["Data Type"] == "Categorical",
-            "Column"
-        ].tolist(),
-
-        "Outlier Summary": outlier_summary.to_dict(
-            orient="records"
-        ),
-
-        "Memory Usage (MB)": round(
-            cleaned_df.memory_usage(deep=True).sum()
-            / (1024 * 1024),
-            2
-        )
-
+        "negative_values": detect_negative_values(cleaned),
+        "repeated_identifier_values": detect_repeated_identifier_values(cleaned),
+        "outliers": detect_outliers(cleaned)
     }
 
     return report
+
+
+def get_quality_summary(df):
+    """Return a compact quality summary for the current dataset."""
+    return {
+        "rows": int(len(df)),
+        "columns": int(len(df.columns)),
+        "missing_cells": int(df.isna().sum().sum()),
+        "exact_duplicate_rows": int(df.duplicated().sum()),
+        "negative_values": detect_negative_values(df),
+        "repeated_identifier_values": detect_repeated_identifier_values(df),
+        "outliers": detect_outliers(df)
+    }
