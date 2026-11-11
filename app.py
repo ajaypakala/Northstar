@@ -107,14 +107,40 @@ except Exception as e:
 # CLEAN DATA
 # ==========================================================
 
-clean_df = clean_dataset(raw_df)
+st.sidebar.divider()
+st.sidebar.subheader("🧹 Cleaning Options")
 
-report = cleaning_report(
-    raw_df,
-    clean_df
+numeric_strategy = st.sidebar.selectbox(
+    "Missing numeric values",
+    ["preserve", "median", "mean"],
+    index=0,
+    help="Preserve keeps missing values. Median/mean fill missing numeric values."
 )
 
-df = clean_df.copy()
+categorical_strategy = st.sidebar.selectbox(
+    "Missing categorical values",
+    ["preserve", "mode", "unknown"],
+    index=0,
+    help="Preserve keeps missing values. Mode/Unknown fill missing text values."
+)
+
+remove_duplicates = st.sidebar.checkbox(
+    "Remove exact duplicate rows",
+    value=True
+)
+
+try:
+    clean_df = clean_dataset(
+        raw_df,
+        numeric_strategy=numeric_strategy,
+        categorical_strategy=categorical_strategy,
+        remove_exact_duplicates=remove_duplicates
+    )
+    report = cleaning_report(raw_df, clean_df)
+    df = clean_df.copy()
+except Exception as e:
+    st.error(f"Data cleaning failed: {e}")
+    st.stop()
 
 # ==========================================================
 # PROFILE
@@ -163,7 +189,14 @@ st.divider()
 
 st.header("🧹 Cleaning Report")
 
-st.json(report)
+report_col1, report_col2, report_col3, report_col4 = st.columns(4)
+report_col1.metric("Original Rows", report["original_rows"])
+report_col2.metric("Cleaned Rows", report["cleaned_rows"])
+report_col3.metric("Rows Removed", report["rows_removed"])
+report_col4.metric("Missing Values Remaining", report["missing_values_after"])
+
+with st.expander("View Detailed Cleaning Report"):
+    st.json(report)
 
 st.divider()
 
